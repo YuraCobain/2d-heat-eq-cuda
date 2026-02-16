@@ -414,6 +414,7 @@ int main(int argc, char **argv) {
           src_add, do_src);
       break;
     case 1:
+      // XXX DOESNT WORK
       step_kernel_smem<<<grid, {BLOCK_X, BLOCK_Y}>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
