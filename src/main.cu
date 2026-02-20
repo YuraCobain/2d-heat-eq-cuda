@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
@@ -180,11 +181,11 @@ __device__ __forceinline__ float d2_8th(const float u0, const float um1,
   // c2 = -1/5
   // c3 =  8/315
   // c4 = -1/560
-  const float c0 = -205.0f / 72.0f;
-  const float c1 = 8.0f / 5.0f;
-  const float c2 = -1.0f / 5.0f;
-  const float c3 = 8.0f / 315.0f;
-  const float c4 = -1.0f / 560.0f;
+  constexpr float c0 = -205.0f / 72.0f;
+  constexpr float c1 =  8.0f / 5.0f;
+  constexpr float c2 = -1.0f / 5.0f;
+  constexpr float c3 =  8.0f / 315.0f;
+  constexpr float c4 = -1.0f / 560.0f;
   return c0 * u0 + c1 * (um1 + up1) + c2 * (um2 + up2) + c3 * (um3 + up3) +
          c4 * (um4 + up4);
 }
@@ -234,58 +235,53 @@ __global__ void step_kernel(float *__restrict__ u_next,
   u_next[idx] = un;
 }
 
+#define R 4
 #define BLOCK_X 32
 #define BLOCK_Y 8
+#define BLOCK_HALO_X (BLOCK_X + 2 * R)
+#define BLOCK_HALO_Y (BLOCK_Y + 2 * R)
 
-#define BLOCK_HALO_X 32 + 4
-#define BLOCK_HALO_Y 8 + 4
 __global__ void step_kernel_smem(float *__restrict__ u_next,
                                  const float *__restrict__ u, int nx, int ny,
                                  float dt, float kappa, float inv_dx2,
                                  float inv_dy2, int src_x, int src_y,
                                  float src_add, int do_src) {
+  (void)src_x;
+  (void)src_y;
+  constexpr int Rk = R;
+
   const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   const int j = (int)(blockIdx.y * blockDim.y + threadIdx.y);
 
-  // Need a 4-cell border for radius-4 stencil
-  if (i < 4 || i >= nx - 4 || j < 4 || j >= ny - 4)
-    return;
+  __shared__ float s_u[BLOCK_HALO_X * BLOCK_HALO_Y];
 
-  __shared__ float s_u[(BLOCK_HALO_X) * (BLOCK_HALO_Y)];
+  const int base_i = (int)blockIdx.x * (int)blockDim.x - Rk;
+  const int base_j = (int)blockIdx.y * (int)blockDim.y - Rk;
 
-  const int idx = j * nx + i;
-  const int s_idx = (threadIdx.y + 4) * (BLOCK_HALO_X) + (threadIdx.x + 4);
+  for (int ty = (int)threadIdx.y; ty < BLOCK_HALO_Y; ty += (int)blockDim.y) {
+    int gj = base_j + ty;
+    gj = max(0, min(ny - 1, gj));
 
-  s_u[s_idx] = u[idx];
-  if (threadIdx.y == 0) {
-    s_u[s_idx - 4] = u[idx - 4];
-    s_u[s_idx - 3] = u[idx - 3];
-    s_u[s_idx - 2] = u[idx - 2];
-    s_u[s_idx - 1] = u[idx - 1];
-  }
-  if (threadIdx.x == 0) {
-    s_u[s_idx - 4 * BLOCK_HALO_X] = u[idx - 4 * nx];
-    s_u[s_idx - 3 * BLOCK_HALO_X] = u[idx - 3 * nx];
-    s_u[s_idx - 2 * BLOCK_HALO_X] = u[idx - 2 * nx];
-    s_u[s_idx - 1 * BLOCK_HALO_X] = u[idx - 1 * nx];
-  }
-  if (threadIdx.y == BLOCK_Y) {
-    s_u[s_idx + 4] = u[idx + 4];
-    s_u[s_idx + 3] = u[idx + 3];
-    s_u[s_idx + 2] = u[idx + 2];
-    s_u[s_idx + 1] = u[idx + 1];
-  }
-  if (threadIdx.x == BLOCK_X) {
-    s_u[s_idx + 4 * BLOCK_HALO_X] = u[idx + 4 * nx];
-    s_u[s_idx + 3 * BLOCK_HALO_X] = u[idx + 3 * nx];
-    s_u[s_idx + 2 * BLOCK_HALO_X] = u[idx + 2 * nx];
-    s_u[s_idx + 1 * BLOCK_HALO_X] = u[idx + 1 * nx];
+    for (int tx = (int)threadIdx.x; tx < BLOCK_HALO_X; tx += (int)blockDim.x) {
+      int gi = base_i + tx;
+      gi = max(0, min(nx - 1, gi));
+
+      s_u[ty * BLOCK_HALO_X + tx] = u[gj * nx + gi];
+    }
   }
 
   __syncthreads();
 
-  // gather x-neighbors
-  const float u00 = s_u[s_idx + 0];
+  if (i < Rk || i >= nx - Rk || j < Rk || j >= ny - Rk) return;
+
+  const int idx = j * nx + i;
+  const int sx = (int)threadIdx.x + Rk;
+  const int sy = (int)threadIdx.y + Rk;
+  const int pitch = BLOCK_HALO_X;
+  const int s_idx = sy * pitch + sx;
+
+  // X neighbors
+  const float u00 = s_u[s_idx];
   const float um1 = s_u[s_idx - 1];
   const float up1 = s_u[s_idx + 1];
   const float um2 = s_u[s_idx - 2];
@@ -295,25 +291,25 @@ __global__ void step_kernel_smem(float *__restrict__ u_next,
   const float um4 = s_u[s_idx - 4];
   const float up4 = s_u[s_idx + 4];
 
-  // gather y-neighbors
-  const float vm1 = s_u[s_idx - 1 * BLOCK_HALO_X];
-  const float vp1 = s_u[s_idx + 1 * BLOCK_HALO_X];
-  const float vm2 = s_u[s_idx - 2 * BLOCK_HALO_X];
-  const float vp2 = s_u[s_idx + 2 * BLOCK_HALO_X];
-  const float vm3 = s_u[s_idx - 3 * BLOCK_HALO_X];
-  const float vp3 = s_u[s_idx + 3 * BLOCK_HALO_X];
-  const float vm4 = s_u[s_idx - 4 * BLOCK_HALO_X];
-  const float vp4 = s_u[s_idx + 4 * BLOCK_HALO_X];
+  // Y neighbors
+  const float vm1 = s_u[s_idx - 1 * pitch];
+  const float vp1 = s_u[s_idx + 1 * pitch];
+  const float vm2 = s_u[s_idx - 2 * pitch];
+  const float vp2 = s_u[s_idx + 2 * pitch];
+  const float vm3 = s_u[s_idx - 3 * pitch];
+  const float vp3 = s_u[s_idx + 3 * pitch];
+  const float vm4 = s_u[s_idx - 4 * pitch];
+  const float vp4 = s_u[s_idx + 4 * pitch];
 
   const float uxx =
       d2_8th(u00, um1, up1, um2, up2, um3, up3, um4, up4) * inv_dx2;
   const float uyy =
       d2_8th(u00, vm1, vp1, vm2, vp2, vm3, vp3, vm4, vp4) * inv_dy2;
+
   float un = u00 + dt * (kappa * (uxx + uyy));
 
-  if (do_src && (i % 128 == 0) && (j % 64 == 0)) {
-    un += src_add; // per-step additive injection
-  }
+  if (do_src && (i % 128 == 0) && (j % 64 == 0)) un += src_add;
+
   u_next[idx] = un;
 }
 
@@ -381,8 +377,9 @@ int main(int argc, char **argv) {
     }
   }
 
-  dim3 block(16, 16, 1);
-  dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y, 1);
+  const dim3 block = (a.k_ver == 1) ? dim3(BLOCK_X, BLOCK_Y, 1)
+                                  : dim3(16, 16, 1);
+  const dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y, 1);
 
   // Optional precise per-step kernel timing (CUDA events). Note: this
   // synchronizes each step.
@@ -409,13 +406,12 @@ int main(int argc, char **argv) {
 
     switch (a.k_ver) {
     case 0:
-      step_kernel<<<grid, {BLOCK_X, BLOCK_Y}>>>(
+      step_kernel<<<grid, block>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
     case 1:
-      // XXX DOESNT WORK
-      step_kernel_smem<<<grid, {BLOCK_X, BLOCK_Y}>>>(
+      step_kernel_smem<<<grid, block>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
