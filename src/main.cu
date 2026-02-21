@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <SDL.h>
-
+#include <vector>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include "vec4_math.cuh"
 
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
@@ -234,58 +235,192 @@ __global__ void step_kernel(float *__restrict__ u_next,
   u_next[idx] = un;
 }
 
+__device__ __constant__ float c_a, c_b, c_c, c_d, c_e;
+__device__ __constant__ Mat4x4f c_Ma, c_Mb, c_Mc;
+
+__device__ __forceinline__ float d2_8th2(float u0, float s1, float s2, float s3, float s4)
+{
+  float acc = c_a * u0;
+  acc = fmaf(c_b, s1, acc);
+  acc = fmaf(c_c, s2, acc);
+  acc = fmaf(c_d, s3, acc);
+  acc = fmaf(c_e, s4, acc);
+  return acc;
+}
+
+__device__ __forceinline__ float4 d8_packet_x(float4 A, float4 B, float4 C)
+{
+  float4 out;
+  out.x = d2_8th2(B.x, A.w + B.y, A.z + B.z, A.y + B.w, A.x + C.x);
+  out.y = d2_8th2(B.y, B.x + B.z, A.w + B.w, A.z + C.x, A.y + C.y);
+  out.z = d2_8th2(B.z, B.y + B.w, B.x + C.x, A.w + C.y, A.z + C.z);
+  out.w = d2_8th2(B.w, B.z + C.x, B.y + C.y, B.x + C.z, A.w + C.w);
+  return out;
+}
+
+__device__ __forceinline__ float4 d8_packet_y(float4 u0, float4 s1, float4 s2, float4 s3, float4 s4)
+{
+  float4 out = mul4(u0, c_a);
+  out = fma4(s1, c_b, out);
+  out = fma4(s2, c_c, out);
+  out = fma4(s3, c_d, out);
+  out = fma4(s4, c_e, out);
+  return out;
+}
+
+__global__ void step_kernel_f4(float4 *__restrict__ u_next4,
+                               const float4 *__restrict__ u4,
+                               int nx, int ny,
+                               float dt, float kappa, float inv_dx2, float inv_dy2,
+                               int src_x, int src_y, float src_add, int do_src)
+{
+  const int W4 = nx >> 2;
+  const int x4 = (int)(blockIdx.x * blockDim.x + threadIdx.x) + 1;  // skip x4=0 halo
+  const int j  = (int)(blockIdx.y * blockDim.y + threadIdx.y) + 4;  // skip top halo
+  if (x4 >= W4 - 1 || j >= ny - 4) return;
+
+  const int idx4 = j * W4 + x4;
+
+  const float4 A = u4[idx4 - 1];
+  const float4 B = u4[idx4];
+  const float4 C = u4[idx4 + 1];
+
+  // uxx = (Ma*A + Mb*B + Mc*C) * inv_dx2
+  float4 uxx = add4(add4(vec_mul(c_Ma, A), vec_mul(c_Mb, B)), vec_mul(c_Mc, C));
+
+  // uyy = (a*B + b*(±1) + c*(±2) + d*(±3) + e*(±4)) * inv_dy2
+  float4 uyy = mul4(B, c_a);
+  uyy = fma4(add4(u4[idx4 - 1 * W4], u4[idx4 + 1 * W4]), c_b, uyy);
+  uyy = fma4(add4(u4[idx4 - 2 * W4], u4[idx4 + 2 * W4]), c_c, uyy);
+  uyy = fma4(add4(u4[idx4 - 3 * W4], u4[idx4 + 3 * W4]), c_d, uyy);
+  uyy = fma4(add4(u4[idx4 - 4 * W4], u4[idx4 + 4 * W4]), c_e, uyy);
+
+  // un = B + dt*kappa*(uxx + uyy)
+  float4 lap = add4(mul4(uxx, inv_dx2), mul4(uyy, inv_dy2));
+  float4 un  = add4(B, mul4(lap, dt * kappa));
+
+  // Keep injection semantics identical to your previous float4 version (lane0 only)
+  if (do_src && (j % 64 == 0)) {
+    int i0 = (x4 << 2);
+    if ((i0 % 128) == 0) un.x += src_add;
+  }
+
+  u_next4[idx4] = un;
+}
+
+template<int SLAB_Y>
+__global__ void step_kernel_f4_roll(float4 *__restrict__ u_next4,
+                                    const float4 *__restrict__ u4,
+                                    int nx, int ny,
+                                    float dt, float kappa,
+                                    float inv_dx2, float inv_dy2,
+                                    int src_x, int src_y,
+                                    float src_add, int do_src)
+{
+  (void)src_x; (void)src_y;
+
+  const int W4 = nx >> 2;
+  const int x4 = (int)(blockIdx.x * blockDim.x + threadIdx.x) + 1;
+  if (x4 >= W4 - 1) return;
+
+  const int base_y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  const int j0 = 4 + base_y * SLAB_Y;
+  if (j0 >= ny - 4) return;
+
+  int idx4 = j0 * W4 + x4;
+
+  // Vertical spine
+  float4 t4 = u4[idx4 - 4 * W4];
+  float4 t3 = u4[idx4 - 3 * W4];
+  float4 t2 = u4[idx4 - 2 * W4];
+  float4 t1 = u4[idx4 - 1 * W4];
+  float4 m = u4[idx4 + 0 * W4];
+  float4 b1 = u4[idx4 + 1 * W4];
+  float4 b2 = u4[idx4 + 2 * W4];
+  float4 b3 = u4[idx4 + 3 * W4];
+  float4 b4 = u4[idx4 + 4 * W4];
+
+#pragma unroll
+  for (int s = 0; s < SLAB_Y; ++s) {
+    const int j = j0 + s;
+    if (j >= ny - 4) break;
+
+    const float4 left = u4[idx4 - 1];
+    const float4 midle = m;
+    const float4 right = u4[idx4 + 1];
+
+    float4 uxx = d8_packet_x(left, midle, right);
+    float4 uyy = d8_packet_y(midle, add4(t1, b1), add4(t2, b2), add4(t3, b3), add4(t4, b4));
+
+    // un = B + dt*kappa*(uxx*inv_dx2 + uyy*inv_dy2)
+    float4 lap = add4(mul4(uxx, inv_dx2), mul4(uyy, inv_dy2));
+    float4 un  = add4(midle, mul4(lap, dt * kappa));
+
+    if (do_src && ((j & 63) == 0)) {
+      int i0 = (x4 << 2);
+      if ((i0 & 127) == 0) un.x += src_add;
+    }
+
+    u_next4[idx4] = un;
+
+    if (s != SLAB_Y - 1) {
+      const int jn = j + 1;
+      if (jn < ny - 4) {
+        // roll spine
+        t4 = t3; t3 = t2; t2 = t1; t1 = m; m = b1;
+        b1 = b2; b2 = b3; b3 = b4; b4 = u4[idx4 + 5 * W4];
+        idx4 += W4;
+      }
+    }
+  }
+}
+
 #define BLOCK_X 32
 #define BLOCK_Y 8
+#define R 4
+#define TILE_X (BLOCK_X + 2*R)   // 40
+#define TILE_Y (BLOCK_Y + 2*R)   // 16
 
-#define BLOCK_HALO_X 32 + 4
-#define BLOCK_HALO_Y 8 + 4
 __global__ void step_kernel_smem(float *__restrict__ u_next,
                                  const float *__restrict__ u, int nx, int ny,
                                  float dt, float kappa, float inv_dx2,
                                  float inv_dy2, int src_x, int src_y,
-                                 float src_add, int do_src) {
-  const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  const int j = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+                                 float src_add, int do_src)
+{
+  const int i = (int)(blockIdx.x * BLOCK_X + threadIdx.x);
+  const int j = (int)(blockIdx.y * BLOCK_Y + threadIdx.y);
 
-  // Need a 4-cell border for radius-4 stencil
-  if (i < 4 || i >= nx - 4 || j < 4 || j >= ny - 4)
-    return;
+  __shared__ float s_u[TILE_Y * TILE_X];
 
-  __shared__ float s_u[(BLOCK_HALO_X) * (BLOCK_HALO_Y)];
+  // top-left of tile in global coords
+  int gx0 = (int)(blockIdx.x * BLOCK_X) - R;
+  int gy0 = (int)(blockIdx.y * BLOCK_Y) - R;
 
-  const int idx = j * nx + i;
-  const int s_idx = (threadIdx.y + 4) * (BLOCK_HALO_X) + (threadIdx.x + 4);
+  // cooperative load of whole tile (with clamping to avoid OOB)
+  for (int ly = (int)threadIdx.y; ly < TILE_Y; ly += BLOCK_Y) {
+    int gy = gy0 + ly;
+    gy = (gy < 0) ? 0 : (gy >= ny ? (ny - 1) : gy);
 
-  s_u[s_idx] = u[idx];
-  if (threadIdx.y == 0) {
-    s_u[s_idx - 4] = u[idx - 4];
-    s_u[s_idx - 3] = u[idx - 3];
-    s_u[s_idx - 2] = u[idx - 2];
-    s_u[s_idx - 1] = u[idx - 1];
-  }
-  if (threadIdx.x == 0) {
-    s_u[s_idx - 4 * BLOCK_HALO_X] = u[idx - 4 * nx];
-    s_u[s_idx - 3 * BLOCK_HALO_X] = u[idx - 3 * nx];
-    s_u[s_idx - 2 * BLOCK_HALO_X] = u[idx - 2 * nx];
-    s_u[s_idx - 1 * BLOCK_HALO_X] = u[idx - 1 * nx];
-  }
-  if (threadIdx.y == BLOCK_Y) {
-    s_u[s_idx + 4] = u[idx + 4];
-    s_u[s_idx + 3] = u[idx + 3];
-    s_u[s_idx + 2] = u[idx + 2];
-    s_u[s_idx + 1] = u[idx + 1];
-  }
-  if (threadIdx.x == BLOCK_X) {
-    s_u[s_idx + 4 * BLOCK_HALO_X] = u[idx + 4 * nx];
-    s_u[s_idx + 3 * BLOCK_HALO_X] = u[idx + 3 * nx];
-    s_u[s_idx + 2 * BLOCK_HALO_X] = u[idx + 2 * nx];
-    s_u[s_idx + 1 * BLOCK_HALO_X] = u[idx + 1 * nx];
+    for (int lx = (int)threadIdx.x; lx < TILE_X; lx += BLOCK_X) {
+      int gx = gx0 + lx;
+      gx = (gx < 0) ? 0 : (gx >= nx ? (nx - 1) : gx);
+
+      s_u[ly * TILE_X + lx] = u[gy * nx + gx];
+    }
   }
 
   __syncthreads();
 
-  // gather x-neighbors
-  const float u00 = s_u[s_idx + 0];
+  // only interior points compute/store
+  if (i < R || i >= nx - R || j < R || j >= ny - R) return;
+
+  const int lx = (int)threadIdx.x + R;
+  const int ly = (int)threadIdx.y + R;
+  const int s_idx = ly * TILE_X + lx;
+
+  const float u00 = s_u[s_idx];
+
+  // x-neighbors
   const float um1 = s_u[s_idx - 1];
   const float up1 = s_u[s_idx + 1];
   const float um2 = s_u[s_idx - 2];
@@ -295,26 +430,26 @@ __global__ void step_kernel_smem(float *__restrict__ u_next,
   const float um4 = s_u[s_idx - 4];
   const float up4 = s_u[s_idx + 4];
 
-  // gather y-neighbors
-  const float vm1 = s_u[s_idx - 1 * BLOCK_HALO_X];
-  const float vp1 = s_u[s_idx + 1 * BLOCK_HALO_X];
-  const float vm2 = s_u[s_idx - 2 * BLOCK_HALO_X];
-  const float vp2 = s_u[s_idx + 2 * BLOCK_HALO_X];
-  const float vm3 = s_u[s_idx - 3 * BLOCK_HALO_X];
-  const float vp3 = s_u[s_idx + 3 * BLOCK_HALO_X];
-  const float vm4 = s_u[s_idx - 4 * BLOCK_HALO_X];
-  const float vp4 = s_u[s_idx + 4 * BLOCK_HALO_X];
+  // y-neighbors
+  const float vm1 = s_u[s_idx - 1 * TILE_X];
+  const float vp1 = s_u[s_idx + 1 * TILE_X];
+  const float vm2 = s_u[s_idx - 2 * TILE_X];
+  const float vp2 = s_u[s_idx + 2 * TILE_X];
+  const float vm3 = s_u[s_idx - 3 * TILE_X];
+  const float vp3 = s_u[s_idx + 3 * TILE_X];
+  const float vm4 = s_u[s_idx - 4 * TILE_X];
+  const float vp4 = s_u[s_idx + 4 * TILE_X];
 
   const float uxx =
       d2_8th(u00, um1, up1, um2, up2, um3, up3, um4, up4) * inv_dx2;
   const float uyy =
       d2_8th(u00, vm1, vp1, vm2, vp2, vm3, vp3, vm4, vp4) * inv_dy2;
+
   float un = u00 + dt * (kappa * (uxx + uyy));
 
-  if (do_src && (i % 128 == 0) && (j % 64 == 0)) {
-    un += src_add; // per-step additive injection
-  }
-  u_next[idx] = un;
+  if (do_src && (i % 128 == 0) && (j % 64 == 0)) un += src_add;
+
+  u_next[j * nx + i] = un;
 }
 
 // Simple PPM (P6) writer for final snapshot
@@ -345,6 +480,8 @@ int main(int argc, char **argv) {
   float *d_u0 = nullptr, *d_u1 = nullptr;
   CUDA_CHECK(cudaMalloc(&d_u0, n * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_u1, n * sizeof(float)));
+
+
   CUDA_CHECK(cudaMemset(d_u0, 0, n * sizeof(float)));
   CUDA_CHECK(cudaMemset(d_u1, 0, n * sizeof(float)));
 
@@ -381,8 +518,48 @@ int main(int argc, char **argv) {
     }
   }
 
-  dim3 block(16, 16, 1);
+  dim3 block(BLOCK_X, BLOCK_Y, 1);
   dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y, 1);
+  
+  const int W4 = nx / 4;
+  dim3 grid4((unsigned)(((W4 - 2) + block.x - 1) / block.x),
+           (unsigned)(((ny - 8) + block.y - 1) / block.y),
+           1);
+  
+   if (a.k_ver == 2 || a.k_ver == 3)
+    {
+      // 8th-order Laplace coefficients
+      const float a = -205.0f / 72.0f;
+      const float b =   8.0f /  5.0f;
+      const float c =  -1.0f /  5.0f;
+      const float d =   8.0f / 315.0f;
+      const float e =  -1.0f / 560.0f;
+
+      Mat4x4f Ma{ float4{e,d,c,b},
+                  float4{0,e,d,c},
+                  float4{0,0,e,d},
+                  float4{0,0,0,e} };
+      
+      Mat4x4f Mb{ float4{a,b,c,d},
+                  float4{b,a,b,c},
+                  float4{c,b,a,b},
+                  float4{d,c,b,a} };
+      
+      Mat4x4f Mc{float4{e,0,0,0},
+                 float4{d,e,0,0},
+                 float4{c,d,e,0},
+                 float4{b,c,d,e} };
+
+      CUDA_CHECK(cudaMemcpyToSymbol(c_a, &a, sizeof(a)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_b, &b, sizeof(b)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_c, &c, sizeof(c)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_d, &d, sizeof(d)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_e, &e, sizeof(e)));
+
+      CUDA_CHECK(cudaMemcpyToSymbol(c_Ma, &Ma, sizeof(Ma)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_Mb, &Mb, sizeof(Mb)));
+      CUDA_CHECK(cudaMemcpyToSymbol(c_Mc, &Mc, sizeof(Mc)));
+   }
 
   // Optional precise per-step kernel timing (CUDA events). Note: this
   // synchronizes each step.
@@ -409,16 +586,34 @@ int main(int argc, char **argv) {
 
     switch (a.k_ver) {
     case 0:
-      step_kernel<<<grid, {BLOCK_X, BLOCK_Y}>>>(
+      step_kernel<<<grid, block>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
     case 1:
-      // XXX DOESNT WORK
-      step_kernel_smem<<<grid, {BLOCK_X, BLOCK_Y}>>>(
+      step_kernel_smem<<<grid, block>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
+   case 2:
+      step_kernel_f4<<<grid4, block>>>((float4*)d_u1, (const float4*)d_u0,
+                                   nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+                                   a.src_x, a.src_y, src_add, do_src);
+      break;
+     
+     case 3: {
+       constexpr int SLAB_Y = 4;
+       dim3 grid4_roll2(
+           grid4.x,
+           (unsigned)(((ny - 8) + (block.y * SLAB_Y - 1)) / (block.y * SLAB_Y)),
+           1);
+       step_kernel_f4_roll<SLAB_Y><<<grid4_roll2, block>>>(
+                                      (float4*)d_u1, (const float4*)d_u0,
+                                       nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+                                       a.src_x, a.src_y, src_add, do_src);
+     }
+      break;
+      
     default:
       std::abort();
     }
