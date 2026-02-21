@@ -1,8 +1,9 @@
 #include <cuda_runtime.h>
 
-#include <SDL.h>
+#include <SDL2/SDL.h>
 
 #include <algorithm>
+#include <vector>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -174,7 +175,7 @@ __device__ __forceinline__ float d2_8th(const float u0, const float um1,
                                         const float up2, const float um3,
                                         const float up3, const float um4,
                                         const float up4) {
-  // coefficients:
+                                            // coefficients:
   // c0 = -205/72
   // c1 =  8/5
   // c2 = -1/5
@@ -234,52 +235,56 @@ __global__ void step_kernel(float *__restrict__ u_next,
   u_next[idx] = un;
 }
 
-#define BLOCK_X 32
-#define BLOCK_Y 8
+#define RADIUS 4
+#define BLOCK_X 16
+#define BLOCK_Y 16
 
-#define BLOCK_HALO_X 32 + 4
-#define BLOCK_HALO_Y 8 + 4
+#define BLOCK_HALO_X (BLOCK_X + 2 * RADIUS + 1)
+#define BLOCK_HALO_Y (BLOCK_Y + 2 * RADIUS)
 __global__ void step_kernel_smem(float *__restrict__ u_next,
                                  const float *__restrict__ u, int nx, int ny,
                                  float dt, float kappa, float inv_dx2,
                                  float inv_dy2, int src_x, int src_y,
                                  float src_add, int do_src) {
-  const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-  const int j = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int i = blockIdx.x * blockDim.x + tx;
+  const int j = blockIdx.y * blockDim.y + ty;
 
   // Need a 4-cell border for radius-4 stencil
-  if (i < 4 || i >= nx - 4 || j < 4 || j >= ny - 4)
+  if (i < RADIUS || i >= nx - RADIUS || j < RADIUS || j >= ny - RADIUS)
     return;
 
   __shared__ float s_u[(BLOCK_HALO_X) * (BLOCK_HALO_Y)];
 
   const int idx = j * nx + i;
-  const int s_idx = (threadIdx.y + 4) * (BLOCK_HALO_X) + (threadIdx.x + 4);
+  const int s_idx = (ty + RADIUS) * BLOCK_HALO_X + (tx + RADIUS);
 
   s_u[s_idx] = u[idx];
-  if (threadIdx.y == 0) {
-    s_u[s_idx - 4] = u[idx - 4];
-    s_u[s_idx - 3] = u[idx - 3];
-    s_u[s_idx - 2] = u[idx - 2];
-    s_u[s_idx - 1] = u[idx - 1];
-  }
-  if (threadIdx.x == 0) {
+
+if (ty == 0) {
     s_u[s_idx - 4 * BLOCK_HALO_X] = u[idx - 4 * nx];
     s_u[s_idx - 3 * BLOCK_HALO_X] = u[idx - 3 * nx];
     s_u[s_idx - 2 * BLOCK_HALO_X] = u[idx - 2 * nx];
     s_u[s_idx - 1 * BLOCK_HALO_X] = u[idx - 1 * nx];
   }
-  if (threadIdx.y == BLOCK_Y) {
-    s_u[s_idx + 4] = u[idx + 4];
-    s_u[s_idx + 3] = u[idx + 3];
-    s_u[s_idx + 2] = u[idx + 2];
-    s_u[s_idx + 1] = u[idx + 1];
+  if (tx == 0) {
+    s_u[s_idx - 4] = u[idx - 4];
+    s_u[s_idx - 3] = u[idx - 3];
+    s_u[s_idx - 2] = u[idx - 2];
+    s_u[s_idx - 1] = u[idx - 1];
   }
-  if (threadIdx.x == BLOCK_X) {
-    s_u[s_idx + 4 * BLOCK_HALO_X] = u[idx + 4 * nx];
-    s_u[s_idx + 3 * BLOCK_HALO_X] = u[idx + 3 * nx];
-    s_u[s_idx + 2 * BLOCK_HALO_X] = u[idx + 2 * nx];
+  if (ty == (BLOCK_Y - 1)) { // fixed
     s_u[s_idx + 1 * BLOCK_HALO_X] = u[idx + 1 * nx];
+    s_u[s_idx + 2 * BLOCK_HALO_X] = u[idx + 2 * nx];
+    s_u[s_idx + 3 * BLOCK_HALO_X] = u[idx + 3 * nx];
+    s_u[s_idx + 4 * BLOCK_HALO_X] = u[idx + 4 * nx];
+  }
+  if (tx == (BLOCK_X - 1)) { // fixed
+    s_u[s_idx + 1] = u[idx + 1];
+    s_u[s_idx + 2] = u[idx + 2];
+    s_u[s_idx + 3] = u[idx + 3];
+    s_u[s_idx + 4] = u[idx + 4];
   }
 
   __syncthreads();
@@ -315,6 +320,82 @@ __global__ void step_kernel_smem(float *__restrict__ u_next,
     un += src_add; // per-step additive injection
   }
   u_next[idx] = un;
+}
+
+__global__ void step_kernel_float4(float *__restrict__ u_next,
+                            const float *__restrict__ u, int nx, int ny,
+                            float dt, float kappa, float inv_dx2, float inv_dy2,
+                            int src_x, int src_y, float src_add, int do_src) {
+    // get thread coords
+    const int nx4 = nx / 4;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int idx = blockIdx.x * blockDim.x + tx;
+    const int idy = blockIdx.y * blockDim.y + ty;
+    const int idg = idy * nx4 + idx;
+
+    // borders guard
+    if (idx == 0 || idx >= nx4 || idy < RADIUS || idy >= ny - RADIUS) return;
+
+    // read input data
+    const float4* in4 = reinterpret_cast<const float4*>(u);
+
+    // experimantal
+    // const float4 cent = __ldg(&in4[idg]);
+    // float4 left, righ;
+    // left.x = __shfl_up_sync(0xffffffff, cent.x, 1, 16);
+    // left.y = __shfl_up_sync(0xffffffff, cent.y, 1, 16);
+    // left.z = __shfl_up_sync(0xffffffff, cent.z, 1, 16);
+    // left.w = __shfl_up_sync(0xffffffff, cent.w, 1, 16);
+    // righ.x = __shfl_down_sync(0xffffffff, cent.x, 1, 16);
+    // righ.y = __shfl_down_sync(0xffffffff, cent.y, 1, 16);
+    // righ.z = __shfl_down_sync(0xffffffff, cent.z, 1, 16);
+    // righ.w = __shfl_down_sync(0xffffffff, cent.w, 1, 16);
+    // if (tx ==  0) left = __ldg(&in4[idg - 1]);
+    // if (tx == 15) righ = __ldg(&in4[idg + 1]);
+
+    const float4 left = __ldg(&in4[idg-1]);
+    const float4 cent = __ldg(&in4[idg+0]);
+    const float4 righ = __ldg(&in4[idg+1]);
+    float4 center[5];
+    center[0] = cent;
+    #pragma unroll
+    for (int i = 1; i <= 4; i++) {
+        const float4 top = __ldg(&in4[idg - nx4*i]);
+        const float4 bot = __ldg(&in4[idg + nx4*i]);
+        center[i] = make_float4(top.x + bot.x, top.y + bot.y, top.z + bot.z, top.w + bot.w);
+    }
+
+    // base constants
+    const float c0 = -205.0f / 72.0f;
+    const float c1 = +8.0f / 5.0f;
+    const float c2 = -1.0f / 5.0f;
+    const float c3 = +8.0f / 315.0f;
+    const float c4 = -1.0f / 560.0f;
+
+    // compute final result
+    const float4 uxx = make_float4(
+        c0 * cent.x + c1 * (left.w + cent.y) + c2 * (left.z + cent.z) + c3 * (left.y + cent.w) + c4 * (left.x + righ.x),
+        c0 * cent.y + c1 * (cent.x + cent.z) + c2 * (left.w + cent.w) + c3 * (left.z + righ.x) + c4 * (left.y + righ.y),
+        c0 * cent.z + c1 * (cent.y + cent.w) + c2 * (cent.x + righ.x) + c3 * (left.w + righ.y) + c4 * (left.z + righ.z),
+        c0 * cent.w + c1 * (cent.z + righ.x) + c2 * (cent.y + righ.y) + c3 * (cent.x + righ.z) + c4 * (left.w + righ.w)
+    );
+    const float4 uyy = make_float4(
+        c0 * center[0].x + c1 * center[1].x + c2 * center[2].x + c3 * center[3].x + c4 * center[4].x,
+        c0 * center[0].y + c1 * center[1].y + c2 * center[2].y + c3 * center[3].y + c4 * center[4].y,
+        c0 * center[0].z + c1 * center[1].z + c2 * center[2].z + c3 * center[3].z + c4 * center[4].z,
+        c0 * center[0].w + c1 * center[1].w + c2 * center[2].w + c3 * center[3].w + c4 * center[4].w
+    );
+    float4 un = make_float4(
+        cent.x + dt * kappa * (uxx.x * inv_dx2 + uyy.x * inv_dy2),
+        cent.y + dt * kappa * (uxx.y * inv_dx2 + uyy.y * inv_dy2),
+        cent.z + dt * kappa * (uxx.z * inv_dx2 + uyy.z * inv_dy2),
+        cent.w + dt * kappa * (uxx.w * inv_dx2 + uyy.w * inv_dy2)
+    );
+
+    if (do_src && (idx % 32 == 0) && (idy % 128 == 0)) un.x += src_add;
+    float4* out4 = reinterpret_cast<float4*>(u_next);
+    out4[idg] = un;
 }
 
 // Simple PPM (P6) writer for final snapshot
@@ -414,8 +495,14 @@ int main(int argc, char **argv) {
           src_add, do_src);
       break;
     case 1:
-      // XXX DOESNT WORK
+      // fixed
       step_kernel_smem<<<grid, {BLOCK_X, BLOCK_Y}>>>(
+          d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
+          src_add, do_src);
+      break;
+    case 2:
+      // float4
+      step_kernel_float4<<<{grid.x / 4, grid.y}, {BLOCK_X, BLOCK_Y}>>>(
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
