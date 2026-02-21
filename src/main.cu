@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <vector>
 
 #include <SDL.h>
 
@@ -234,6 +235,63 @@ __global__ void step_kernel(float *__restrict__ u_next,
   u_next[idx] = un;
 }
 
+// ver0-style naive kernel, but computed only for a Y-slab [y_begin..y_end] (inclusive).
+__global__ void step_kernel_y_range(float *__restrict__ u_next,
+                                    const float *__restrict__ u,
+                                    int nx, int ny,
+                                    float dt, float kappa,
+                                    float inv_dx2, float inv_dy2,
+                                    int src_x, int src_y,
+                                    float src_add, int do_src,
+                                    int y_begin, int y_end)
+{
+  (void)src_x; (void)src_y; // kept to preserve call signature shape
+
+  const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  const int j = y_begin + (int)(blockIdx.y * blockDim.y + threadIdx.y);
+
+  // Slab tail (grid.y rounded up)
+  if (j > y_end) return;
+
+  // Need a 4-cell border for radius-4 stencil (global domain border)
+  if (i < 4 || i >= nx - 4 || j < 4 || j >= ny - 4) return;
+
+  const int idx = j * nx + i;
+
+  // gather x-neighbors
+  const float u0  = u[idx];
+  const float um1 = u[idx - 1];
+  const float up1 = u[idx + 1];
+  const float um2 = u[idx - 2];
+  const float up2 = u[idx + 2];
+  const float um3 = u[idx - 3];
+  const float up3 = u[idx + 3];
+  const float um4 = u[idx - 4];
+  const float up4 = u[idx + 4];
+
+  // gather y-neighbors
+  const float vm1 = u[idx - nx];
+  const float vp1 = u[idx + nx];
+  const float vm2 = u[idx - 2 * nx];
+  const float vp2 = u[idx + 2 * nx];
+  const float vm3 = u[idx - 3 * nx];
+  const float vp3 = u[idx + 3 * nx];
+  const float vm4 = u[idx - 4 * nx];
+  const float vp4 = u[idx + 4 * nx];
+
+  const float uxx = d2_8th(u0, um1, up1, um2, up2, um3, up3, um4, up4) * inv_dx2;
+  const float uyy = d2_8th(u0, vm1, vp1, vm2, vp2, vm3, vp3, vm4, vp4) * inv_dy2;
+
+  float un = u0 + dt * (kappa * (uxx + uyy));
+
+  // Keep injection semantics identical to ver0: global i/j modulo pattern
+  if (do_src && (i % 128 == 0) && (j % 64 == 0)) {
+    un += src_add;
+  }
+
+  u_next[idx] = un;
+}
+
 #define BLOCK_X 32
 #define BLOCK_Y 8
 
@@ -381,7 +439,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  dim3 block(16, 16, 1);
+  dim3 block(BLOCK_X, BLOCK_Y, 1);
   dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y, 1);
 
   // Optional precise per-step kernel timing (CUDA events). Note: this
@@ -400,9 +458,11 @@ int main(int argc, char **argv) {
   const double target_frame_ms = 1000.0 / (double)a.fps;
   auto last_frame = std::chrono::high_resolution_clock::now();
 
-  for (int step = 0; step < a.steps; ++step) {
+  for (int step = 0; step < a.steps;) {
     const int do_src = (step < a.src_steps && step < 100) ? 1 : 0;
     const float src_add = (do_src ? a.src_amp : 0.0f);
+
+    int step_inc = 1; // how many simulation steps we advance this iteration
 
     if (a.timing)
       CUDA_CHECK(cudaEventRecord(ev_start));
@@ -419,6 +479,58 @@ int main(int argc, char **argv) {
           d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2, a.src_x, a.src_y,
           src_add, do_src);
       break;
+
+      // Two-step wavefront (Y-slab), ver0-math, 4 launches per 2 steps.
+      // Requires: step_kernel_y_range(...)
+      case 10: {
+         // If only 1 step remains, do a single normal step.
+          if (step + 1 >= a.steps) {
+            const int do_src = (step < a.src_steps && step < 100) ? 1 : 0;
+            const float src_add = do_src ? a.src_amp : 0.0f;
+
+            step_kernel<<<grid, block>>>(
+                d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+                a.src_x, a.src_y, src_add, do_src);
+
+            step_inc = 1;
+            break;
+          }
+
+          constexpr int R = 4;
+          const int M = ny / 2;
+
+          auto launch = [&](float* out, const float* in,
+                            int y0, int y1,
+                            float src_add, int do_src) {
+            const int slab_h = y1 - y0 + 1;
+            dim3 grid_slab(grid.x, (unsigned)((slab_h + block.y - 1) / block.y), 1);
+
+            step_kernel_y_range<<<grid_slab, block>>>(
+                out, in, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+                a.src_x, a.src_y, src_add, do_src, y0, y1);
+          };
+
+          // Injection params must match the global step index for each sub-step.
+          const int do_src0 = (step < a.src_steps && step < 100) ? 1 : 0;
+          const float src_add0 = do_src0 ? a.src_amp : 0.0f;
+
+          const int step1 = step + 1;
+          const int do_src1 = (step1 < a.src_steps && step1 < 100) ? 1 : 0;
+          const float src_add1 = do_src1 ? a.src_amp : 0.0f;
+
+          // Step 0: u0 -> u1 (left half + halo)
+          launch(d_u1, d_u0, 0,      M + R - 1, src_add0, do_src0);
+          // Step 1: u1 -> u0 (left half)
+          launch(d_u0, d_u1, 0,      M - 1,     src_add1, do_src1);
+
+          // Step 0: u0 -> u1 (right half, skipping halo band)
+          launch(d_u1, d_u0, M + R,  ny - 1,    src_add0, do_src0);
+          // Step 1: u1 -> u0 (right half, includes seam)
+          launch(d_u0, d_u1, M,      ny - 1,    src_add1, do_src1);
+
+          step_inc = 2;
+        } break;
+
     default:
       std::abort();
     }
@@ -429,9 +541,9 @@ int main(int argc, char **argv) {
       CUDA_CHECK(cudaEventSynchronize(ev_stop));
       float ms = 0.0f;
       CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-      kstats.push((double)ms);
-      if ((step + 1) % a.timing_print_every == 0) {
-        std::cout << "[timing] step=" << (step + 1)
+      kstats.push((double)ms/step_inc);
+      if ((step + step_inc) % a.timing_print_every == 0) {
+        std::cout << "[timing] step=" << (step + step_inc)
                   << "  kernel_ms(mean)=" << kstats.mean
                   << "  kernel_ms(std)=" << kstats.stddev_sample()
                   << "  min=" << kstats.minv << "  max=" << kstats.maxv
@@ -439,8 +551,11 @@ int main(int argc, char **argv) {
       }
     }
 
-    // swap buffers
-    std::swap(d_u0, d_u1);
+    // Swap only when the "current" field ends up in d_u1 (normal 1-step path).
+    // For case 10 with step_inc==2, current field is already in d_u0 (do NOT swap).
+    if (!(a.k_ver == 10 && step_inc == 2)) {
+      std::swap(d_u0, d_u1);
+    }
 
     const bool want_render = (!a.no_vis) && (step % a.dump_every == 0);
     if (want_render) {
@@ -509,6 +624,8 @@ int main(int argc, char **argv) {
                   << "\n";
       }
     }
+
+    step += step_inc;
   }
 
   if (a.timing) {
