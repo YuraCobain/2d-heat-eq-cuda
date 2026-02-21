@@ -388,12 +388,37 @@ static void write_ppm(const std::string &path, const std::vector<uint8_t> &rgb,
   std::fclose(f);
 }
 
+template <class Callback>
+inline void wavefront_scheduler(int N, int tile, int R, Callback&& cb) {
+
+    const int K = (N + tile - 1) / tile;
+
+    for (int t = 0; t < K; ++t) {
+        const int s = t * tile;
+        const int e = std::min((t + 1) * tile - 1, N - 1);
+
+        int lo0 = (t == 0) ? s : (s + R);
+        int hi0 = std::min(e + R, N - 1);
+
+        if (lo0 <= hi0) {
+            cb(lo0, hi0, 0); // phase 0
+        }
+
+        cb(s, e, 1); // phase 1
+    }
+}
+
 int main(int argc, char **argv) {
   Args a = parse_args(argc, argv);
 
   const int nx = a.nx;
   const int ny = a.ny;
   const size_t n = (size_t)nx * (size_t)ny;
+
+  int dev = 0;
+  CUDA_CHECK(cudaGetDevice(&dev));
+  int l2_size = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, dev));
 
   // Host buffers
   std::vector<float> h_u(n, 0.0f);
@@ -480,56 +505,55 @@ int main(int argc, char **argv) {
           src_add, do_src);
       break;
 
-      // Two-step wavefront (Y-slab), ver0-math, 4 launches per 2 steps.
-      // Requires: step_kernel_y_range(...)
-      case 10: {
-         // If only 1 step remains, do a single normal step.
-          if (step + 1 >= a.steps) {
-            const int do_src = (step < a.src_steps && step < 100) ? 1 : 0;
-            const float src_add = do_src ? a.src_amp : 0.0f;
+    // Performs two steps with overlap - the front of the first step overtakes the front of the second,
+    // so data integrity is preserved, but both passes operate on "hot" data that probably has not
+    // yet been evicted from the L2 cache.
+    case 10: {
+      int l2_floats = l2_size / sizeof(float);
 
-            step_kernel<<<grid, block>>>(
-                d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
-                a.src_x, a.src_y, src_add, do_src);
+      // If we don't have two steps or the task fits completely into the cache, then we perform a regular pass.
+      if (step + 1 >= a.steps || l2_floats > 2 * n) {
+        const int do_src = (step < a.src_steps && step < 100) ? 1 : 0;
+        const float src_add = do_src ? a.src_amp : 0.0f;
 
-            step_inc = 1;
-            break;
-          }
+        step_kernel<<<grid, block>>>(
+            d_u1, d_u0, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+            a.src_x, a.src_y, src_add, do_src);
 
-          constexpr int R = 4;
-          const int M = ny / 2;
+        step_inc = 1;
+        break;
+      }
 
-          auto launch = [&](float* out, const float* in,
-                            int y0, int y1,
-                            float src_add, int do_src) {
-            const int slab_h = y1 - y0 + 1;
-            dim3 grid_slab(grid.x, (unsigned)((slab_h + block.y - 1) / block.y), 1);
+      constexpr int R = 4;
+      const float max_l2_load = 0.7;  // tune this!
+      const int tile_y = (int)(max_l2_load * l2_floats / 2 / nx) ;
 
-            step_kernel_y_range<<<grid_slab, block>>>(
-                out, in, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
-                a.src_x, a.src_y, src_add, do_src, y0, y1);
-          };
+      const int src_steps_eff = std::min(a.src_steps, 100);
 
-          // Injection params must match the global step index for each sub-step.
-          const int do_src0 = (step < a.src_steps && step < 100) ? 1 : 0;
-          const float src_add0 = do_src0 ? a.src_amp : 0.0f;
+      auto launch = [&](float* out, const float* in,
+                        int y0, int y1,
+                        float src_add, int do_src) {
+        const int slab_h = y1 - y0 + 1;
+        dim3 grid_slab(grid.x, (unsigned)((slab_h + block.y - 1) / block.y), 1);
 
-          const int step1 = step + 1;
-          const int do_src1 = (step1 < a.src_steps && step1 < 100) ? 1 : 0;
-          const float src_add1 = do_src1 ? a.src_amp : 0.0f;
+        step_kernel_y_range<<<grid_slab, block>>>(
+            out, in, nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+            a.src_x, a.src_y, src_add, do_src, y0, y1);
+      };
 
-          // Step 0: u0 -> u1 (left half + halo)
-          launch(d_u1, d_u0, 0,      M + R - 1, src_add0, do_src0);
-          // Step 1: u1 -> u0 (left half)
-          launch(d_u0, d_u1, 0,      M - 1,     src_add1, do_src1);
+      auto cb = [&](int start, int stop, int phase) {
+        const int gstep = step + phase;                 // phase: 0 -> step, 1 -> step+1
+        const int do_src = (gstep < src_steps_eff) ? 1 : 0;
+        const float src_add = do_src ? a.src_amp : 0.0f;
 
-          // Step 0: u0 -> u1 (right half, skipping halo band)
-          launch(d_u1, d_u0, M + R,  ny - 1,    src_add0, do_src0);
-          // Step 1: u1 -> u0 (right half, includes seam)
-          launch(d_u0, d_u1, M,      ny - 1,    src_add1, do_src1);
+        if (phase == 0) launch(d_u1, d_u0, start, stop, src_add, do_src); // u0->u1
+        else            launch(d_u0, d_u1, start, stop, src_add, do_src); // u1->u0
+      };
 
-          step_inc = 2;
-        } break;
+      wavefront_scheduler(ny, tile_y, R, cb);
+
+      step_inc = 2;
+    } break;
 
     default:
       std::abort();
