@@ -238,6 +238,36 @@ __global__ void step_kernel(float *__restrict__ u_next,
 __device__ __constant__ float c_a, c_b, c_c, c_d, c_e;
 __device__ __constant__ Mat4x4f c_Ma, c_Mb, c_Mc;
 
+__device__ __forceinline__ float d2_8th2(float u0, float s1, float s2, float s3, float s4)
+{
+  float acc = c_a * u0;
+  acc = fmaf(c_b, s1, acc);
+  acc = fmaf(c_c, s2, acc);
+  acc = fmaf(c_d, s3, acc);
+  acc = fmaf(c_e, s4, acc);
+  return acc;
+}
+
+__device__ __forceinline__ float4 d8_packet_x(float4 A, float4 B, float4 C)
+{
+  float4 out;
+  out.x = d2_8th2(B.x, A.w + B.y, A.z + B.z, A.y + B.w, A.x + C.x);
+  out.y = d2_8th2(B.y, B.x + B.z, A.w + B.w, A.z + C.x, A.y + C.y);
+  out.z = d2_8th2(B.z, B.y + B.w, B.x + C.x, A.w + C.y, A.z + C.z);
+  out.w = d2_8th2(B.w, B.z + C.x, B.y + C.y, B.x + C.z, A.w + C.w);
+  return out;
+}
+
+__device__ __forceinline__ float4 d8_packet_y(float4 u0, float4 s1, float4 s2, float4 s3, float4 s4)
+{
+  float4 out = mul4(u0, c_a);
+  out = fma4(s1, c_b, out);
+  out = fma4(s2, c_c, out);
+  out = fma4(s3, c_d, out);
+  out = fma4(s4, c_e, out);
+  return out;
+}
+
 __global__ void step_kernel_f4(float4 *__restrict__ u_next4,
                                const float4 *__restrict__ u4,
                                int nx, int ny,
@@ -278,8 +308,75 @@ __global__ void step_kernel_f4(float4 *__restrict__ u_next4,
   u_next4[idx4] = un;
 }
 
-#define BLOCK_X 16
-#define BLOCK_Y 16
+template<int SLAB_Y>
+__global__ void step_kernel_f4_roll(float4 *__restrict__ u_next4,
+                                    const float4 *__restrict__ u4,
+                                    int nx, int ny,
+                                    float dt, float kappa,
+                                    float inv_dx2, float inv_dy2,
+                                    int src_x, int src_y,
+                                    float src_add, int do_src)
+{
+  (void)src_x; (void)src_y;
+
+  const int W4 = nx >> 2;
+  const int x4 = (int)(blockIdx.x * blockDim.x + threadIdx.x) + 1;
+  if (x4 >= W4 - 1) return;
+
+  const int base_y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  const int j0 = 4 + base_y * SLAB_Y;
+  if (j0 >= ny - 4) return;
+
+  int idx4 = j0 * W4 + x4;
+
+  // Vertical spine
+  float4 t4 = u4[idx4 - 4 * W4];
+  float4 t3 = u4[idx4 - 3 * W4];
+  float4 t2 = u4[idx4 - 2 * W4];
+  float4 t1 = u4[idx4 - 1 * W4];
+  float4 m = u4[idx4 + 0 * W4];
+  float4 b1 = u4[idx4 + 1 * W4];
+  float4 b2 = u4[idx4 + 2 * W4];
+  float4 b3 = u4[idx4 + 3 * W4];
+  float4 b4 = u4[idx4 + 4 * W4];
+
+#pragma unroll
+  for (int s = 0; s < SLAB_Y; ++s) {
+    const int j = j0 + s;
+    if (j >= ny - 4) break;
+
+    const float4 left = u4[idx4 - 1];
+    const float4 midle = m;
+    const float4 right = u4[idx4 + 1];
+
+    float4 uxx = d8_packet_x(left, midle, right);
+    float4 uyy = d8_packet_y(midle, add4(t1, b1), add4(t2, b2), add4(t3, b3), add4(t4, b4));
+
+    // un = B + dt*kappa*(uxx*inv_dx2 + uyy*inv_dy2)
+    float4 lap = add4(mul4(uxx, inv_dx2), mul4(uyy, inv_dy2));
+    float4 un  = add4(midle, mul4(lap, dt * kappa));
+
+    if (do_src && ((j & 63) == 0)) {
+      int i0 = (x4 << 2);
+      if ((i0 & 127) == 0) un.x += src_add;
+    }
+
+    u_next4[idx4] = un;
+
+    if (s != SLAB_Y - 1) {
+      const int jn = j + 1;
+      if (jn < ny - 4) {
+        // roll spine
+        t4 = t3; t3 = t2; t2 = t1; t1 = m; m = b1;
+        b1 = b2; b2 = b3; b3 = b4; b4 = u4[idx4 + 5 * W4];
+        idx4 += W4;
+      }
+    }
+  }
+}
+
+#define BLOCK_X 32
+#define BLOCK_Y 8
 #define R 4
 #define TILE_X (BLOCK_X + 2*R)   // 40
 #define TILE_Y (BLOCK_Y + 2*R)   // 16
@@ -383,6 +480,8 @@ int main(int argc, char **argv) {
   float *d_u0 = nullptr, *d_u1 = nullptr;
   CUDA_CHECK(cudaMalloc(&d_u0, n * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_u1, n * sizeof(float)));
+
+
   CUDA_CHECK(cudaMemset(d_u0, 0, n * sizeof(float)));
   CUDA_CHECK(cudaMemset(d_u1, 0, n * sizeof(float)));
 
@@ -427,6 +526,7 @@ int main(int argc, char **argv) {
            (unsigned)(((ny - 8) + block.y - 1) / block.y),
            1);
   
+   if (a.k_ver == 2 || a.k_ver == 3)
     {
       // 8th-order Laplace coefficients
       const float a = -205.0f / 72.0f;
@@ -500,6 +600,20 @@ int main(int argc, char **argv) {
                                    nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
                                    a.src_x, a.src_y, src_add, do_src);
       break;
+     
+     case 3: {
+       constexpr int SLAB_Y = 4;
+       dim3 grid4_roll2(
+           grid4.x,
+           (unsigned)(((ny - 8) + (block.y * SLAB_Y - 1)) / (block.y * SLAB_Y)),
+           1);
+       step_kernel_f4_roll<SLAB_Y><<<grid4_roll2, block>>>(
+                                      (float4*)d_u1, (const float4*)d_u0,
+                                       nx, ny, a.dt, a.kappa, inv_dx2, inv_dy2,
+                                       a.src_x, a.src_y, src_add, do_src);
+     }
+      break;
+      
     default:
       std::abort();
     }
